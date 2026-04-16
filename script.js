@@ -563,7 +563,7 @@ window.searchCustomers = function() {
   let input = document.getElementById('searchInput').value.toLowerCase();
   let items = document.querySelectorAll('.customer-item');
   items.forEach(item => {
-    let name = item.querySelector('.customer-header span').innerText.toLowerCase();
+    let name = item.querySelector('.customer-name-wrap span').innerText.toLowerCase();
     if (name.includes(input)) {
       item.style.display = '';
     } else {
@@ -663,8 +663,11 @@ window.renderCustomers = function() {
 
     itemDiv.innerHTML = `
         <div class="customer-header">
-          <span>${customer.name} الدين: ${currentDebt} دينار</span>
-          <span>${remainingText}</span>
+          <div class="customer-name-wrap">
+            <span>${customer.name}</span>
+            <span class="customer-debt-inline">الدين: ${currentDebt} دينار</span>
+          </div>
+          <span dir="rtl">${remainingText}</span>
         </div>
         <div class="customer-details" id="details-${customer.id}">
           <p>الدين: ${currentDebt} دينار</p>
