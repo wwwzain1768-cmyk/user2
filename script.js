@@ -1,7 +1,14 @@
 // script.js
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-app.js";
-import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-auth.js";
-import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-firestore.js";
+import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-auth.js";
+import { getFirestore, doc, setDoc, getDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-firestore.js";
+
+// تسجيل Service Worker
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js').catch(err => console.log('SW registration failed', err));
+    });
+}
 
 const firebaseConfig = {
     apiKey: "AIzaSyBcFdnGgYs8dAbp_fF2Xy9jOa5_avE0l9o",
@@ -16,437 +23,792 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-let towersArray = [];
-let allCustomers = [];
-let sectorsArray = [];
-let editIndex = null;
-let editSectorIndex = null;
-let totalSubscribers = 0;
-let totalDebt = 0;
+let currentLoggedTowerCode = "";
+let currentLoggedTowerName = "";
+let editCustomerId = null;
+let allTowersData = [];
+let allCustomersData = [];
+let networkBannerDismissed = false;
+let isSyncing = false;
 
-window.openTab = function(tabId, evt) {
-    let contents = document.getElementsByClassName('tab-content');
-    for (let i = 0; i < contents.length; i++) contents[i].classList.remove('active');
-
-    let buttons = document.getElementsByClassName('tab-btn');
-    for (let i = 0; i < buttons.length; i++) buttons[i].classList.remove('active');
-
-    document.getElementById(tabId).classList.add('active');
-    if (evt && evt.currentTarget) evt.currentTarget.classList.add('active');
-
-    if (tabId === 'tab-towers') renderDetailedTowers();
-    if (tabId === 'tab-sectors') renderSectors();
+async function saveLoginState() {
+    await localforage.setItem('savedTowerLogin', { towerCode: currentLoggedTowerCode, towerName: currentLoggedTowerName });
 }
 
-window.saveTower = async function() {
-    let name = document.getElementById('towerName').value.trim();
-    let owner = document.getElementById('ownerName').value.trim();
-    let code = document.getElementById('towerCode').value.trim();
+async function clearLoginState() {
+    await localforage.removeItem('savedTowerLogin');
+}
 
-    if (name === "" || owner === "" || code === "") {
-        alert("الرجاء تعبئة جميع الحقول!");
-        return;
+function goToDashboardDirect() {
+    document.getElementById('auth-screen').style.display = 'none';
+    document.getElementById('login-section').style.display = 'none';
+    document.getElementById('greeting-section').style.display = 'none';
+    document.getElementById('dashboard-section').style.display = 'block';
+    if (currentLoggedTowerName) {
+        document.getElementById('greeting-text').innerText = currentLoggedTowerName;
     }
+    window.renderCustomers();
+    updateSearchAvailability();
+}
 
-    let newTower = { towerName: name, ownerName: owner, towerCode: code };
 
-    if (editIndex === null) {
-        towersArray.push(newTower);
-        await setDoc(doc(db, "data", "towers"), { towersArray });
+function calculateEndDateFromStartDate(startDate) {
+    if (!startDate) return "";
+    let start = new Date(startDate);
+    let endDate = new Date(start);
+    endDate.setDate(start.getDate() + 30);
+    return endDate.toISOString().split('T')[0];
+}
+
+function updateEndDateFromStartDate() {
+    let startDate = document.getElementById('startDate').value;
+    document.getElementById('endDate').value = calculateEndDateFromStartDate(startDate);
+}
+
+// تحديث حالة توفر البحث حسب الاتصال
+function updateSearchAvailability() {
+    const searchInput = document.getElementById('searchInput');
+    const searchBtn = document.getElementById('searchBtn');
+    const block = document.getElementById('search-offline-block');
+    if (!searchInput || !searchBtn || !block) return;
+
+    if (!navigator.onLine) {
+        // وضع عدم الاتصال: حجب البحث
+        searchInput.disabled = true;
+        searchInput.value = "";
+        searchBtn.disabled = true;
+        block.style.display = 'block';
+        // إلغاء أي تصفية نشطة
+        const items = document.querySelectorAll('.customer-item');
+        items.forEach(item => { item.style.display = ''; });
     } else {
-        let oldCode = towersArray[editIndex].towerCode;
-        towersArray[editIndex] = newTower;
+        // وضع الاتصال: فتح البحث
+        searchInput.disabled = false;
+        searchBtn.disabled = false;
+        block.style.display = 'none';
+    }
+}
 
-        if (oldCode !== code) {
-            let customersUpdated = false;
-            for (let i = 0; i < allCustomers.length; i++) {
-                if (allCustomers[i].towerCode === oldCode) {
-                    allCustomers[i].towerCode = code;
-                    customersUpdated = true;
+// إدارة حالة الاتصال والمزامنة
+function updateNetworkStatus(status) {
+    const banner = document.getElementById('network-status');
+    const bannerText = document.getElementById('network-status-text');
+    banner.className = 'status-banner ' + status;
+    if (status === 'online') {
+        networkBannerDismissed = false;
+        banner.style.display = 'block';
+        bannerText.innerText = 'متصل بالإنترنت - البيانات محدثة';
+        setTimeout(() => { banner.style.display = 'none'; }, 2000);
+    } else if (status === 'offline') {
+        if (networkBannerDismissed) {
+            banner.style.display = 'none';
+        } else {
+            banner.style.display = 'block';
+            bannerText.innerText = 'وضع عدم الاتصال (أوفلاين) - سيتم حفظ البيانات محلياً';
+        }
+    } else if (status === 'syncing') {
+        networkBannerDismissed = false;
+        banner.style.display = 'block';
+        bannerText.innerText = 'جاري مزامنة البيانات...';
+    }
+    // تحديث حالة البحث (لا يتأثر بـ dismiss الخاص بالشريط)
+    updateSearchAvailability();
+}
+
+window.dismissNetworkStatus = function() {
+    networkBannerDismissed = true;
+    document.getElementById('network-status').style.display = 'none';
+    // ملاحظة: لا نغير حالة حجب البحث هنا - يبقى الحجب طالما أوفلاين
+}
+
+window.addEventListener('online', () => {
+    networkBannerDismissed = false;
+    updateNetworkStatus('online');
+    processSyncQueue();
+});
+
+window.addEventListener('offline', () => {
+    updateNetworkStatus('offline');
+});
+
+if (!navigator.onLine) {
+    updateNetworkStatus('offline');
+}
+
+window.addEventListener('load', () => {
+    updateSearchAvailability();
+    if (navigator.onLine) processSyncQueue();
+});
+
+window.addEventListener('focus', () => {
+    if (navigator.onLine) processSyncQueue();
+});
+
+// مهم للموبايل: عند العودة للتطبيق بعد تبديل التطبيقات
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+        updateSearchAvailability();
+        if (navigator.onLine) processSyncQueue();
+    }
+});
+
+// فحص دوري كل 15 ثانية - إذا كان هناك طابور ولم تتم مزامنته، حاول من جديد
+setInterval(async () => {
+    if (navigator.onLine && !isSyncing) {
+        let queue = await localforage.getItem('syncQueue') || [];
+        if (queue.length > 0) {
+            processSyncQueue();
+        }
+    }
+}, 15000);
+
+// نظام طابور المزامنة (Sync Queue) لمنع التكرار والحفظ للأوفلاين
+async function saveOperationToQueue(action, id, customerData) {
+    let queue = await localforage.getItem('syncQueue') || [];
+    
+    if (action === 'delete') {
+        queue = queue.filter(op => op.id !== id);
+        queue.push({ action: 'delete', id: id });
+    } else if (action === 'edit') {
+        let existingIdx = queue.findIndex(op => op.id === id);
+        if (existingIdx !== -1) {
+            queue[existingIdx].customer = customerData;
+        } else {
+            queue.push({ action: 'edit', id: id, customer: customerData });
+        }
+    } else if (action === 'add') {
+        queue.push({ action: 'add', id: id, customer: customerData });
+    }
+    
+    await localforage.setItem('syncQueue', queue);
+}
+
+async function processSyncQueue() {
+    if (isSyncing) return; // منع التزامن المتوازي
+    if (!navigator.onLine) return;
+
+    let queue = await localforage.getItem('syncQueue') || [];
+    if (queue.length === 0) return;
+
+    isSyncing = true;
+    updateNetworkStatus('syncing');
+    
+    try {
+        const docRef = doc(db, "data", "customers");
+        const docSnap = await getDoc(docRef);
+        let latestData = docSnap.exists() ? docSnap.data().customersData || [] : [];
+
+        for (let op of queue) {
+            if (op.action === 'add') {
+                let exists = latestData.find(c => c.id === op.customer.id);
+                if (!exists) latestData.push(op.customer);
+            } else if (op.action === 'edit') {
+                let idx = latestData.findIndex(c => c.id === op.id);
+                if (idx !== -1) {
+                    latestData[idx] = op.customer;
+                } else {
+                    latestData.push(op.customer);
                 }
-            }
-            if (customersUpdated) {
-                await setDoc(doc(db, "data", "customers"), { customersData: allCustomers });
+            } else if (op.action === 'delete') {
+                latestData = latestData.filter(c => c.id !== op.id);
             }
         }
 
-        editIndex = null;
-        document.getElementById('towerSaveBtn').innerText = "حفظ البرج";
-        await setDoc(doc(db, "data", "towers"), { towersArray });
-    }
-
-    document.getElementById('towerName').value = "";
-    document.getElementById('ownerName').value = "";
-    document.getElementById('towerCode').value = "";
-}
-
-window.deleteTower = async function(index) {
-    if (confirm("هل أنت متأكد من حذف هذا البرج؟")) {
-        towersArray.splice(index, 1);
-        await setDoc(doc(db, "data", "towers"), { towersArray });
+        await setDoc(docRef, { customersData: latestData });
+        allCustomersData = latestData;
+        await localforage.setItem('cachedCustomers', allCustomersData);
+        await localforage.setItem('syncQueue', []);
+        if (currentLoggedTowerCode) window.renderCustomers();
+        isSyncing = false;
+        updateNetworkStatus('online');
+    } catch (error) {
+        console.error("Sync failed", error);
+        isSyncing = false;
+        updateNetworkStatus('offline');
     }
 }
 
-window.editTower = function(index) {
-    document.getElementById('towerName').value = towersArray[index].towerName;
-    document.getElementById('ownerName').value = towersArray[index].ownerName;
-    document.getElementById('towerCode').value = towersArray[index].towerCode;
-    document.getElementById('towerSaveBtn').innerText = "تحديث بيانات البرج";
-    editIndex = index;
-}
-
-window.openTowerInfo = function(index) {
-    let selectedTower = towersArray[index];
-    alert(`تم الدخول إلى البرج: ${selectedTower.towerName}\nالرجاء الذهاب لتبويبة (الأبراج) لعرض التفاصيل الكاملة والسجل.`);
-}
-
-window.saveSector = async function() {
-    const villageName = document.getElementById('sectorVillage').value.trim();
-    const sectorNumber = document.getElementById('sectorNumber').value.trim();
-    const sectorIp = document.getElementById('sectorIp').value.trim();
-
-    if (villageName === "" || sectorNumber === "" || sectorIp === "") {
-        alert("الرجاء تعبئة جميع الحقول!");
-        return;
+// تحميل البيانات مبدئياً من المحلي (Offline First)
+async function initData() {
+    let cachedCustomers = await localforage.getItem('cachedCustomers');
+    if (cachedCustomers) {
+        allCustomersData = cachedCustomers;
+        if (currentLoggedTowerCode) window.renderCustomers();
     }
 
-    const newSector = {
-        villageName,
-        sectorNumber,
-        sectorIp
-    };
-
-    if (editSectorIndex === null) {
-        sectorsArray.push(newSector);
-    } else {
-        sectorsArray[editSectorIndex] = newSector;
-        editSectorIndex = null;
-        document.getElementById('sectorSaveBtn').innerText = "حفظ السكتر";
+    let cachedTowers = await localforage.getItem('cachedTowers');
+    if (cachedTowers) {
+        allTowersData = cachedTowers;
     }
 
-    await setDoc(doc(db, "data", "sectors"), { sectorsArray });
-    clearSectorForm();
-}
-
-window.editSector = function(index) {
-    const sector = sectorsArray[index];
-    document.getElementById('sectorVillage').value = sector.villageName || "";
-    document.getElementById('sectorNumber').value = sector.sectorNumber || "";
-    document.getElementById('sectorIp').value = sector.sectorIp || "";
-    document.getElementById('sectorSaveBtn').innerText = "تحديث بيانات السكتر";
-    editSectorIndex = index;
-    document.getElementById('tab-sectors').scrollIntoView({ behavior: 'smooth', block: 'start' });
-}
-
-window.deleteSector = async function(index) {
-    if (!confirm("هل أنت متأكد من حذف هذا السكتر؟")) return;
-    sectorsArray.splice(index, 1);
-    await setDoc(doc(db, "data", "sectors"), { sectorsArray });
-    if (editSectorIndex === index) {
-        editSectorIndex = null;
-        clearSectorForm();
-        document.getElementById('sectorSaveBtn').innerText = "حفظ السكتر";
-    }
-}
-
-window.openSectorIp = function(ip) {
-    const value = String(ip || '').trim();
-    if (!value) return;
-    const url = /^https?:\/\//i.test(value) ? value : `http://${value}`;
-    // استخدام عنصر رابط للفتح - أكثر موثوقية خصوصاً في وضع PWA
-    const a = document.createElement('a');
-    a.href = url;
-    a.target = '_blank';
-    a.rel = 'noopener noreferrer';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-}
-
-function buildSectorIpUrl(ipRaw) {
-    const value = String(ipRaw || '').trim();
-    if (!value) return '';
-    return /^https?:\/\//i.test(value) ? value : `http://${value}`;
-}
-
-function escapeHtml(str) {
-    return String(str || '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-}
-
-function clearSectorForm() {
-    document.getElementById('sectorVillage').value = "";
-    document.getElementById('sectorNumber').value = "";
-    document.getElementById('sectorIp').value = "";
-}
-
-let deferredPrompt;
-window.addEventListener('beforeinstallprompt', (e) => {
-    e.preventDefault();
-    deferredPrompt = e;
-    document.getElementById('installAppBtn').style.display = 'block';
-});
-
-document.getElementById('installAppBtn').addEventListener('click', async () => {
-    if (deferredPrompt) {
-        deferredPrompt.prompt();
-        const { outcome } = await deferredPrompt.userChoice;
-        if (outcome === 'accepted') {
-            document.getElementById('installAppBtn').style.display = 'none';
+    onSnapshot(doc(db, "data", "towers"), async (docSnap) => {
+        if (docSnap.exists()) {
+            allTowersData = docSnap.data().towersArray || [];
+            await localforage.setItem('cachedTowers', allTowersData);
         }
-        deferredPrompt = null;
-    }
-});
+    });
 
-document.getElementById('google-login-btn').addEventListener('click', () => {
-    const provider = new GoogleAuthProvider();
-    signInWithPopup(auth, provider).catch(error => {
+    onSnapshot(doc(db, "data", "customers"), async (docSnap) => {
+        if (docSnap.exists()) {
+            let queue = await localforage.getItem('syncQueue') || [];
+            if (queue.length === 0) {
+                allCustomersData = docSnap.data().customersData || [];
+                await localforage.setItem('cachedCustomers', allCustomersData);
+                if (currentLoggedTowerCode) window.renderCustomers();
+            } else if (navigator.onLine && !isSyncing) {
+                // البيانات جاءت من Firestore لكن عندنا طابور ينتظر - عالج الطابور الآن
+                processSyncQueue();
+            }
+        }
+    });
+    if (navigator.onLine) {
+        processSyncQueue();
+    }
+}
+initData();
+
+window.loginWithGoogle = function() {
+    setPersistence(auth, browserLocalPersistence).then(() => {
+        const provider = new GoogleAuthProvider();
+        return signInWithPopup(auth, provider);
+    }).catch(error => {
         alert("خطأ: " + error.message);
     });
-});
+};
 
-document.getElementById('verify-code-btn').addEventListener('click', () => {
-    if (document.getElementById('adminCode').value === '1001') {
-        document.getElementById('code-screen').style.display = 'none';
-        document.getElementById('main-content').style.display = 'block';
-
-        const welcomeScreen = document.getElementById('welcome-screen');
-        welcomeScreen.style.opacity = '1';
-        welcomeScreen.style.display = 'flex';
-        setTimeout(() => {
-            welcomeScreen.style.opacity = '0';
-            setTimeout(() => { welcomeScreen.style.display = 'none'; }, 1000);
-        }, 3000);
-
-        loadTowers();
-    } else {
-        alert('الرمز غير صحيح!');
-    }
-});
-
-onAuthStateChanged(auth, (user) => {
-    if (user) {
+onAuthStateChanged(auth, async (user) => {
+    if(user) {
         document.getElementById('auth-screen').style.display = 'none';
-        document.getElementById('code-screen').style.display = 'flex';
+        const savedLogin = await localforage.getItem('savedTowerLogin');
+        if (savedLogin && savedLogin.towerCode) {
+            currentLoggedTowerCode = savedLogin.towerCode;
+            currentLoggedTowerName = savedLogin.towerName || "";
+            goToDashboardDirect();
+            if (navigator.onLine) processSyncQueue();
+        } else if (!currentLoggedTowerCode) {
+            document.getElementById('login-section').style.display = 'block';
+        }
     } else {
         document.getElementById('auth-screen').style.display = 'flex';
-        document.getElementById('code-screen').style.display = 'none';
-        document.getElementById('main-content').style.display = 'none';
+        document.getElementById('login-section').style.display = 'none';
+        document.getElementById('dashboard-section').style.display = 'none';
+        document.getElementById('greeting-section').style.display = 'none';
     }
 });
 
-function loadTowers() {
-    onSnapshot(doc(db, "data", "towers"), (docSnap) => {
-        if (docSnap.exists()) {
-            towersArray = docSnap.data().towersArray || [];
-        } else {
-            towersArray = [];
-        }
-        renderTowers();
-        renderDetailedTowers();
-    });
+window.showModal = function(msg, type, onConfirmCallback) {
+    document.getElementById('customModal').style.display = 'flex';
+    document.getElementById('modalMsg').innerText = msg;
+    let actions = document.getElementById('modalActions');
+    actions.innerHTML = "";
 
-    onSnapshot(doc(db, "data", "customers"), (docSnap) => {
-        if (docSnap.exists()) {
-            allCustomers = docSnap.data().customersData || [];
-        } else {
-            allCustomers = [];
-        }
-        updateStats();
-        renderDetailedTowers();
-    });
+    if (type === 'alert') {
+        let btn = document.createElement('button');
+        btn.className = 'modal-btn btn-confirm';
+        btn.innerText = 'حسناً';
+        btn.onclick = () => { document.getElementById('customModal').style.display = 'none'; };
+        actions.appendChild(btn);
+    } else if (type === 'confirm') {
+        let btnYes = document.createElement('button');
+        btnYes.className = 'modal-btn btn-confirm';
+        btnYes.innerText = 'نعم';
+        btnYes.onclick = () => { 
+            document.getElementById('customModal').style.display = 'none'; 
+            if (onConfirmCallback) onConfirmCallback();
+        };
+        let btnNo = document.createElement('button');
+        btnNo.className = 'modal-btn btn-cancel';
+        btnNo.innerText = 'إلغاء';
+        btnNo.onclick = () => { document.getElementById('customModal').style.display = 'none'; };
+        actions.appendChild(btnYes);
+        actions.appendChild(btnNo);
+    }
+}
 
-    onSnapshot(doc(db, "data", "sectors"), (docSnap) => {
-        if (docSnap.exists()) {
-            sectorsArray = docSnap.data().sectorsArray || [];
-        } else {
-            sectorsArray = [];
+window.showInputModal = function(msg, onConfirmCallback) {
+    document.getElementById('inputModal').style.display = 'flex';
+    document.getElementById('inputModalMsg').innerText = msg;
+    document.getElementById('inputModalValue').value = "";
+    let actions = document.getElementById('inputModalActions');
+    actions.innerHTML = "";
+
+    let btnYes = document.createElement('button');
+    btnYes.className = 'modal-btn btn-confirm';
+    btnYes.innerText = 'تأكيد';
+    btnYes.onclick = () => { 
+        let val = document.getElementById('inputModalValue').value;
+        document.getElementById('inputModal').style.display = 'none'; 
+        if (onConfirmCallback) onConfirmCallback(val);
+    };
+    let btnNo = document.createElement('button');
+    btnNo.className = 'modal-btn btn-cancel';
+    btnNo.innerText = 'إلغاء';
+    btnNo.onclick = () => { document.getElementById('inputModal').style.display = 'none'; };
+    
+    actions.appendChild(btnYes);
+    actions.appendChild(btnNo);
+}
+
+window.showNoteModal = function(msg, onConfirmCallback) {
+    document.getElementById('noteModal').style.display = 'flex';
+    document.getElementById('noteModalMsg').innerText = msg;
+    document.getElementById('noteModalValue').value = "";
+    let actions = document.getElementById('noteModalActions');
+    actions.innerHTML = "";
+
+    let btnYes = document.createElement('button');
+    btnYes.className = 'modal-btn btn-confirm';
+    btnYes.innerText = 'تأكيد';
+    btnYes.onclick = () => { 
+        let val = document.getElementById('noteModalValue').value;
+        document.getElementById('noteModal').style.display = 'none'; 
+        if (onConfirmCallback) onConfirmCallback(val);
+    };
+    let btnNo = document.createElement('button');
+    btnNo.className = 'modal-btn btn-cancel';
+    btnNo.innerText = 'إلغاء';
+    btnNo.onclick = () => { document.getElementById('noteModal').style.display = 'none'; };
+    
+    actions.appendChild(btnYes);
+    actions.appendChild(btnNo);
+}
+
+window.checkCode = function() {
+    let enteredCode = document.getElementById('enteredCode').value;
+    let errorMsg = document.getElementById('error-msg');
+    
+    if (allTowersData.length === 0) { 
+        errorMsg.innerText = "لا توجد أبراج مسجلة! تأكد من إنشائها في موقع الإدارة أولاً."; 
+        return; 
+    }
+
+    let foundTower = null;
+
+    for (let i = 0; i < allTowersData.length; i++) {
+        if (allTowersData[i].towerCode === enteredCode) { 
+            foundTower = allTowersData[i]; 
+            break; 
         }
-        renderSectors();
+    }
+
+    if (foundTower) {
+        errorMsg.innerText = ""; 
+        currentLoggedTowerCode = foundTower.towerCode; 
+        currentLoggedTowerName = foundTower.towerName || "";
+        
+        document.getElementById('greeting-text').innerText = currentLoggedTowerName;
+        document.getElementById('login-section').style.display = 'none';
+        document.getElementById('greeting-section').style.display = 'flex';
+    } else {
+        errorMsg.innerText = "كلمة السر (الرمز) غير صحيحة، يرجى المحاولة مرة أخرى.";
+    }
+}
+
+window.confirmIdentity = async function() {
+    document.getElementById('greeting-section').style.display = 'none';
+    document.getElementById('dashboard-section').style.display = 'block';
+    await saveLoginState();
+    if (navigator.onLine) processSyncQueue();
+    window.renderCustomers(); 
+    updateSearchAvailability();
+}
+
+window.cancelLogin = async function() {
+    document.getElementById('greeting-section').style.display = 'none';
+    document.getElementById('login-section').style.display = 'block';
+    document.getElementById('enteredCode').value = "";
+    currentLoggedTowerCode = ""; 
+    currentLoggedTowerName = "";
+    await clearLoginState();
+}
+
+window.switchAccount = async function() {
+    document.getElementById('dashboard-section').style.display = 'none';
+    document.getElementById('greeting-section').style.display = 'none';
+    document.getElementById('login-section').style.display = 'block';
+    document.getElementById('enteredCode').value = "";
+    currentLoggedTowerCode = "";
+    currentLoggedTowerName = "";
+    await clearLoginState();
+}
+
+window.switchCustomerTab = function(tab) {
+    document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+    document.querySelectorAll('.customer-tab-content').forEach(content => content.classList.remove('active'));
+
+    if(tab === 'all') {
+        document.querySelector('.tab-btn:nth-child(1)').classList.add('active');
+        document.getElementById('all-customers-tab').classList.add('active');
+    } else {
+        document.querySelector('.tab-btn:nth-child(2)').classList.add('active');
+        document.getElementById('expired-customers-tab').classList.add('active');
+    }
+}
+
+window.toggleAddForm = function() {
+    let formSection = document.getElementById('addCustomerSection');
+    if (formSection.style.display === 'none') {
+        formSection.style.display = 'block';
+        if (editCustomerId === null) {
+            let today = new Date();
+            document.getElementById('startDate').value = today.toISOString().split('T')[0];
+            updateEndDateFromStartDate();
+        }
+    } else {
+        formSection.style.display = 'none';
+        window.resetForm();
+    }
+}
+
+window.resetForm = function() {
+    document.getElementById('customerName').value = "";
+    document.getElementById('customerPrice').value = "";
+    document.getElementById('startDate').value = "";
+    document.getElementById('endDate').value = "";
+    editCustomerId = null;
+    document.getElementById('saveCustomerBtn').innerText = "حفظ بيانات الزبون";
+}
+
+window.addCustomer = async function() {
+    let name = document.getElementById('customerName').value;
+    let price = document.getElementById('customerPrice').value;
+    let startDate = document.getElementById('startDate').value;
+    let endDate = calculateEndDateFromStartDate(startDate);
+
+    if (name === "" || price === "" || startDate === "" || endDate === "") { 
+        window.showModal("الرجاء تعبئة جميع البيانات!", "alert"); 
+        return; 
+    }
+
+    if (editCustomerId === null) {
+        let newCustomer = {
+            id: Date.now(),
+            towerCode: currentLoggedTowerCode,
+            name: name,
+            price: price,
+            startDate: startDate,
+            endDate: endDate,
+            paid: 0,
+            debts: 0,
+            history: [{date: new Date().toISOString().split('T')[0], action: 'تسجيل اشتراك', amount: parseFloat(price)}],
+            isPaid: false
+        };
+        allCustomersData.push(newCustomer);
+        await saveOperationToQueue('add', newCustomer.id, newCustomer);
+        window.showModal("تمت إضافة الزبون بنجاح!", "alert");
+    } else {
+        let updatedCustomer;
+        for (let i = 0; i < allCustomersData.length; i++) {
+            if (allCustomersData[i].id === editCustomerId) {
+                allCustomersData[i].name = name;
+                allCustomersData[i].price = price;
+                allCustomersData[i].startDate = startDate;
+                allCustomersData[i].endDate = endDate;
+                updatedCustomer = allCustomersData[i];
+                break;
+            }
+        }
+        await saveOperationToQueue('edit', editCustomerId, updatedCustomer);
+        window.showModal("تم التعديل بنجاح!", "alert");
+    }
+
+    await localforage.setItem('cachedCustomers', allCustomersData);
+    window.resetForm();
+    document.getElementById('addCustomerSection').style.display = 'none';
+    window.renderCustomers();
+
+    if (navigator.onLine) processSyncQueue();
+}
+
+window.searchCustomers = function() {
+    // لا يعمل البحث في وضع أوفلاين
+    if (!navigator.onLine) return;
+
+    let input = document.getElementById('searchInput').value.toLowerCase();
+    let items = document.querySelectorAll('.customer-item');
+    items.forEach(item => {
+        let name = item.querySelector('.customer-header span').innerText.toLowerCase();
+        if (name.includes(input)) {
+            item.style.display = '';
+        } else {
+            item.style.display = 'none';
+        }
     });
 }
 
-function updateStats() {
-    totalSubscribers = allCustomers.length;
-    totalDebt = 0;
+window.renderCustomers = function() {
+    let listContainer = document.getElementById('customersList');
+    let expiredContainer = document.getElementById('expiredList');
+    listContainer.innerHTML = ""; 
+    expiredContainer.innerHTML = "";
 
-    allCustomers.forEach(cust => {
-        let cDebts = parseFloat(cust.debts || 0);
-        let cPaid = parseFloat(cust.paid || 0);
-        let cPrice = parseFloat(cust.price || 0);
-        let cTotal = cPrice + cDebts;
+    let towerCustomers = allCustomersData.filter(cust => cust.towerCode === currentLoggedTowerCode);
+
+    towerCustomers.sort((a, b) => {
+        let getRemainingMs = (dateString) => {
+            if (!dateString) return 0;
+            let end = new Date(dateString);
+            end.setHours(23, 59, 59, 999);
+            return end - new Date();
+        };
+        return getRemainingMs(a.endDate) - getRemainingMs(b.endDate);
+    });
+
+    let towerDebt = 0;
+    towerCustomers.forEach(cust => {
+        let cDebts = cust.debts || 0;
+        let cPaid = cust.paid || 0;
+        let cTotal = parseFloat(cust.price || 0) + parseFloat(cDebts);
         let rem = cTotal - cPaid;
-        if (rem > 0) totalDebt += rem;
-    });
-
-    document.getElementById('totalTowersCount').innerText = towersArray.length;
-    document.getElementById('totalSubscribers').innerText = totalSubscribers;
-    document.getElementById('totalDebt').innerText = totalDebt;
-}
-
-function renderTowers() {
-    updateStats();
-    let listContainer = document.getElementById('towersList');
-    listContainer.innerHTML = "";
-
-    towersArray.forEach((tower, index) => {
-        let itemDiv = document.createElement('div');
-        itemDiv.className = 'tower-item';
-        itemDiv.onclick = function() { openTowerInfo(index); };
-
-        itemDiv.innerHTML = `
-            <div class="tower-info">
-                <div>
-                    <p><strong>البرج:</strong> ${tower.towerName}</p>
-                    <p><strong>المالك:</strong> ${tower.ownerName}</p>
-                    <p><strong>الرمز:</strong> ${tower.towerCode}</p>
-                </div>
-                <div class="action-btns">
-                    <button class="edit-btn" onclick="event.stopPropagation(); editTower(${index})">تعديل</button>
-                    <button class="delete-btn" onclick="event.stopPropagation(); deleteTower(${index})">حذف</button>
-                </div>
-            </div>
-        `;
-        listContainer.appendChild(itemDiv);
-    });
-}
-
-function renderDetailedTowers() {
-    let listContainer = document.getElementById('detailedTowersList');
-    if (!listContainer) return;
-    listContainer.innerHTML = "";
-
-    let allTowersDebt = 0;
-
-    towersArray.forEach((tower, index) => {
-        let towerCustomers = allCustomers.filter(c => c.towerCode === tower.towerCode);
-
-        let tSubs = towerCustomers.length;
-        let tDebt = 0;
-        let tRem = 0;
-        let customersHTML = "";
-
-        towerCustomers.forEach(cust => {
-            let cDebts = parseFloat(cust.debts || 0);
-            let cPaid = parseFloat(cust.paid || 0);
-            let cPrice = parseFloat(cust.price || 0);
-            let cTotal = cPrice + cDebts;
-            let rem = cTotal - cPaid;
-
-            tDebt += cDebts;
-            if (rem > 0) tRem += rem;
-
-            customersHTML += `
-                <div class="history-item">
-                    <p><strong>الاسم:</strong> ${cust.name}</p>
-                    <p><strong>الرقم:</strong> ${cust.phone}</p>
-                    <p><strong>المبلغ المطلوب الكلي (مع الدين):</strong> ${cTotal} | <strong>الباقي:</strong> <span style="color:#e74c3c; font-weight:bold;">${rem}</span></p>
-                </div>
-            `;
-        });
-
-        allTowersDebt += tDebt;
-
-        if (customersHTML === "") {
-            customersHTML = "<p style='text-align:center; color:#7f8c8d; padding: 10px;'>لا يوجد مشتركين في هذا البرج حالياً.</p>";
+        if (rem > 0) {
+            towerDebt += rem;
         }
+    });
+    
+    document.getElementById('towerSubscribers').innerText = towerCustomers.length;
+    document.getElementById('towerDebt').innerText = towerDebt;
+
+    if (towerCustomers.length === 0) {
+        listContainer.innerHTML = "<p style='text-align:center; color:#7f8c8d;'>لا يوجد زبائن حالياً في هذا البرج.</p>";
+        expiredContainer.innerHTML = "<p style='text-align:center; color:#7f8c8d;'>لا يوجد زبائن منتهية اشتراكاتهم.</p>";
+        return;
+    }
+
+    towerCustomers.forEach(customer => {
+        // حساب موحد للانتهاء والمدة المتبقية (نهاية اليوم 23:59:59)
+        let diffMs = 0;
+        let isExpired = true;
+        if (customer.endDate) {
+            let endDateTime = new Date(customer.endDate);
+            endDateTime.setHours(23, 59, 59, 999);
+            let now = new Date();
+            diffMs = endDateTime - now;
+            isExpired = diffMs <= 0;
+        }
+        
+        let cDebts = customer.debts || 0;
+        let cPaid = customer.paid || 0;
+        let originalPrice = parseFloat(customer.price || 0) + parseFloat(cDebts);
+        let currentTotal = originalPrice - cPaid;
+        let remaining = currentTotal;
+        let currentDebt = Math.max(remaining, 0);
 
         let itemDiv = document.createElement('div');
-        itemDiv.className = 'tower-item';
-
+        itemDiv.className = 'customer-item';
+        
         itemDiv.onclick = function(e) {
             if (e.target.tagName.toLowerCase() === 'button') return;
-            let details = document.getElementById('tower-details-tab-' + index);
-            if (details.classList.contains('show')) details.classList.remove('show');
-            else details.classList.add('show');
+            let details = document.getElementById('details-' + customer.id);
+            if (details.classList.contains('show')) {
+                details.classList.remove('show');
+            } else {
+                details.classList.add('show');
+            }
         };
+
+        let paymentHTML = "";
+        if (remaining <= 0) {
+            paymentHTML = `<span class="paid-badge">✔ تم التسديد</span>`;
+        } else {
+            paymentHTML = `<button class="pay-btn" onclick="paySubscription(${customer.id})">تسديد</button>`;
+        }
+
+        // صياغة نص المدة المتبقية (يوم/ساعة/دقيقة) بشكل متسق مع isExpired
+        let remainingText = 'منتهي';
+        if (!isExpired) {
+            let totalMinutes = Math.floor(diffMs / (1000 * 60));
+            let totalHours = Math.floor(totalMinutes / 60);
+            let displayDays = Math.floor(totalHours / 24);
+            let displayHours = totalHours % 24;
+            let displayMinutes = totalMinutes % 60;
+
+            if (displayDays > 0) {
+                remainingText = displayDays + ' يوم ' + displayHours + ' ساعة';
+            } else if (displayHours > 0) {
+                remainingText = displayHours + ' ساعة ' + displayMinutes + ' دقيقة';
+            } else {
+                remainingText = displayMinutes + ' دقيقة';
+            }
+        }
 
         itemDiv.innerHTML = `
             <div class="customer-header">
-                <span>${tower.towerName}</span>
-                <span style="font-size: 0.9rem; color: #7f8c8d">الرمز: ${tower.towerCode}</span>
-            </div>
-            <div class="customer-details" id="tower-details-tab-${index}">
-                <div class="customer-info" style="margin-bottom: 15px; border-bottom: 1px solid #bdc3c7; padding-bottom: 10px;">
-                    <p><strong>المالك:</strong> ${tower.ownerName}</p>
-                    <p><strong>عدد المشتركين:</strong> ${tSubs}</p>
-                    <p><strong>الدين الكلي المضاف:</strong> ${tDebt} دينار</p>
-                    <p><strong>الباقي من الديون:</strong> <span style="color:#e74c3c; font-weight:bold;">${tRem} دينار</span></p>
+                <div class="customer-name-wrap">
+                    <span>${customer.name}</span>
+                    <span class="customer-debt-inline">الدين: ${currentDebt} دينار</span>
                 </div>
-                <h4 style="margin-bottom: 10px; color: #2980b9;">سجل المشتركين:</h4>
-                ${customersHTML}
+                <span style="font-size: 0.9rem; color: ${isExpired ? '#e74c3c' : '#27ae60'}">${remainingText}</span>
+            </div>
+            <div class="customer-details" id="details-${customer.id}">
+                <div class="customer-info">
+                    <p><strong>الدين:</strong> <span style="color:#e74c3c; font-weight:bold;">${currentDebt} دينار</span></p>
+                    <p><strong>تاريخ البدء:</strong> ${customer.startDate}</p>
+                    <p><strong>تاريخ الانتهاء:</strong> ${customer.endDate}</p>
+                </div>
+                <div class="payment-action" style="margin-top: 15px;">
+                    <button class="renew-btn" onclick="renewSubscription(${customer.id})">تجديد الاشتراك</button>
+                    <button class="note-btn" onclick="addNote(${customer.id})">ملاحظات</button>
+                    <button class="add-debt-btn" onclick="addDebt(${customer.id})">إضافة دين</button>
+                    ${paymentHTML}
+                    <button class="edit-btn" onclick="editCustomer(${customer.id})">تعديل</button>
+                    <button class="history-btn" onclick="showHistory(${customer.id})">سجل كامل</button>
+                    <button class="delete-btn" onclick="deleteCustomer(${customer.id})">حذف</button>
+                </div>
             </div>
         `;
+
         listContainer.appendChild(itemDiv);
+
+        if (isExpired) {
+            let expDiv = itemDiv.cloneNode(true);
+            expDiv.innerHTML = itemDiv.innerHTML.replace(`id="details-${customer.id}"`, `id="details-exp-${customer.id}"`);
+            expDiv.onclick = function(e) {
+                if (e.target.tagName.toLowerCase() === 'button') return;
+                let details = document.getElementById('details-exp-' + customer.id);
+                if (details.classList.contains('show')) details.classList.remove('show');
+                else details.classList.add('show');
+            };
+            expiredContainer.appendChild(expDiv);
+        }
     });
 
-    document.getElementById('allTowersDebtTop').innerText = allTowersDebt;
+    if (expiredContainer.innerHTML === "") {
+        expiredContainer.innerHTML = "<p style='text-align:center; color:#7f8c8d;'>لا يوجد زبائن منتهية اشتراكاتهم.</p>";
+    }
 }
 
-function renderSectors() {
-    const wrapper = document.getElementById('sectorsTableWrapper');
-    if (!wrapper) return;
+window.paySubscription = function(id) {
+    window.showInputModal("أدخل المبلغ المراد تسديده:", async (amount) => {
+        if(!amount || isNaN(amount) || amount <= 0) {
+            window.showModal("الرجاء إدخال مبلغ صحيح!", "alert");
+            return;
+        }
+        let customer = allCustomersData.find(c => c.id === id);
+        if (customer) {
+            customer.paid = (customer.paid || 0) + parseFloat(amount);
+            customer.history = customer.history || [];
+            let today = new Date().toISOString().split('T')[0];
+            customer.history.push({date: today, action: `تسديد مبلغ`, amount: parseFloat(amount)});
+            
+            await saveOperationToQueue('edit', id, customer);
+            await localforage.setItem('cachedCustomers', allCustomersData);
+            window.showModal("تم التسديد بنجاح!", "alert");
+            window.renderCustomers();
+            if (navigator.onLine) processSyncQueue();
+        }
+    });
+}
 
-    if (!Array.isArray(sectorsArray) || sectorsArray.length === 0) {
-        wrapper.innerHTML = `<div class="empty-box">لا توجد سكاتر مضافة حالياً.</div>`;
-        return;
+window.renewSubscription = function(id) {
+    window.showInputModal("أدخل مبلغ التجديد:", async (amount) => {
+        if(!amount || isNaN(amount) || amount <= 0) {
+            window.showModal("الرجاء إدخال مبلغ صحيح!", "alert");
+            return;
+        }
+        let customer = allCustomersData.find(c => c.id === id);
+        if (customer) {
+            customer.debts = (customer.debts || 0) + parseFloat(amount);
+            
+            let start = new Date();
+            customer.startDate = start.toISOString().split('T')[0];
+            customer.endDate = calculateEndDateFromStartDate(customer.startDate);
+
+            customer.history = customer.history || [];
+            let todayStr = new Date().toISOString().split('T')[0];
+            customer.history.push({date: todayStr, action: `تجديد الاشتراك`, amount: parseFloat(amount)});
+            
+            await saveOperationToQueue('edit', id, customer);
+            await localforage.setItem('cachedCustomers', allCustomersData);
+            window.showModal("تم تجديد الاشتراك بنجاح!", "alert");
+            window.renderCustomers();
+            if (navigator.onLine) processSyncQueue();
+        }
+    });
+}
+
+window.addDebt = function(id) {
+    window.showInputModal("أدخل مبلغ الدين المضاف:", async (amount) => {
+        if(!amount || isNaN(amount) || amount <= 0) {
+            window.showModal("الرجاء إدخال مبلغ صحيح!", "alert");
+            return;
+        }
+        let customer = allCustomersData.find(c => c.id === id);
+        if (customer) {
+            customer.debts = (customer.debts || 0) + parseFloat(amount);
+            customer.history = customer.history || [];
+            let today = new Date().toISOString().split('T')[0];
+            customer.history.push({date: today, action: `إضافة دين`, amount: parseFloat(amount)});
+            
+            await saveOperationToQueue('edit', id, customer);
+            await localforage.setItem('cachedCustomers', allCustomersData);
+            window.showModal("تمت إضافة الدين بنجاح!", "alert");
+            window.renderCustomers();
+            if (navigator.onLine) processSyncQueue();
+        }
+    });
+}
+
+window.addNote = function(id) {
+    window.showNoteModal("أدخل الملاحظة:", async (note) => {
+        if(!note || note.trim() === "") {
+            return;
+        }
+        let customer = allCustomersData.find(c => c.id === id);
+        if (customer) {
+            customer.history = customer.history || [];
+            let today = new Date().toISOString().split('T')[0];
+            customer.history.push({date: today, action: `ملاحظة: ${note}`, amount: ""});
+            
+            await saveOperationToQueue('edit', id, customer);
+            await localforage.setItem('cachedCustomers', allCustomersData);
+            window.showModal("تمت إضافة الملاحظة بنجاح!", "alert");
+            window.renderCustomers();
+            if (navigator.onLine) processSyncQueue();
+        }
+    });
+}
+
+window.showHistory = function(id) {
+    let customer = allCustomersData.find(c => c.id === id);
+    if (customer) {
+        let historyHTML = "";
+        let historyArr = customer.history || [];
+        if (historyArr.length === 0) {
+            historyHTML = "<p style='text-align:center; color:#7f8c8d;'>لا يوجد سجل متاح.</p>";
+        } else {
+            historyHTML = historyArr.map(h => `<div class='history-item'><strong>${h.date}:</strong> ${h.action} ${h.amount !== "" ? '(' + h.amount + ' دينار)' : ''}</div>`).join('');
+        }
+        document.getElementById('historyContent').innerHTML = historyHTML;
+        document.getElementById('historyModal').style.display = 'flex';
     }
+}
 
-    const grouped = {};
-    sectorsArray.forEach((sector, index) => {
-        const villageName = (sector.villageName || '').trim() || 'بدون اسم';
-        if (!grouped[villageName]) grouped[villageName] = [];
-        grouped[villageName].push({ ...sector, originalIndex: index });
+window.editCustomer = function(id) {
+    let customer = allCustomersData.find(c => c.id === id);
+    if (customer) {
+        document.getElementById('customerName').value = customer.name;
+        document.getElementById('customerPrice').value = customer.price;
+        document.getElementById('startDate').value = customer.startDate || "";
+        document.getElementById('endDate').value = customer.endDate || "";
+
+        editCustomerId = id;
+        document.getElementById('saveCustomerBtn').innerText = "تحديث بيانات الزبون";
+        
+        document.getElementById('addCustomerSection').style.display = 'block';
+        window.scrollTo(0, 0);
+    }
+}
+
+
+document.getElementById('startDate').addEventListener('change', updateEndDateFromStartDate);
+
+window.deleteCustomer = function(id) {
+    window.showModal("هل تود الحذف بالتأكيد؟", "confirm", async () => {
+        allCustomersData = allCustomersData.filter(c => c.id !== id);
+        await saveOperationToQueue('delete', id, null);
+        await localforage.setItem('cachedCustomers', allCustomersData);
+        window.showModal("تم الحذف بنجاح!", "alert");
+        window.renderCustomers();
+        if (navigator.onLine) processSyncQueue();
     });
-
-    const villageNames = Object.keys(grouped);
-    let html = `
-        <table class="sectors-table">
-            <thead>
-                <tr>
-                    <th>القرية</th>
-                    <th>السكتر</th>
-                    <th>الايبيات</th>
-                    <th>الإجراءات</th>
-                </tr>
-            </thead>
-            <tbody>
-    `;
-
-    villageNames.forEach(villageName => {
-        const rows = grouped[villageName];
-        rows.forEach((sector, rowIndex) => {
-            html += `<tr>`;
-
-            if (rowIndex === 0) {
-                html += `<td class="village-name-cell" rowspan="${rows.length}">${escapeHtml(villageName)}</td>`;
-            }
-
-            const ipRaw = sector.sectorIp || '';
-            const ipUrl = buildSectorIpUrl(ipRaw);
-            const ipCellHtml = ipRaw
-                ? `<a class="ip-link" href="${escapeHtml(ipUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(ipRaw)}</a>`
-                : '';
-
-            html += `
-                <td>${escapeHtml(sector.sectorNumber || '')}</td>
-                <td>${ipCellHtml}</td>
-                <td>
-                    <div class="sector-actions">
-                        <button class="edit-btn" onclick="editSector(${sector.originalIndex})">تعديل</button>
-                        <button class="delete-btn" onclick="deleteSector(${sector.originalIndex})">حذف</button>
-                    </div>
-                </td>
-            `;
-
-            html += `</tr>`;
-        });
-    });
-
-    html += `</tbody></table>`;
-    wrapper.innerHTML = html;
 }
