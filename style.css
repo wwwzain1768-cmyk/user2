@@ -23,13 +23,30 @@ h2 { margin-bottom: 20px; color: #2c3e50; }
 .form-group { margin-bottom: 20px; padding: 0 30px; }
 input[type="text"], input[type="password"], input[type="number"], input[type="date"] { width: 100%; padding: 15px; border: 2px solid #bdc3c7; border-radius: 8px; font-size: 1.1rem; outline: none; transition: 0.3s; text-align: right; }
 input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus, input[type="date"]:focus { border-color: #3498db; box-shadow: 0 0 8px rgba(52, 152, 219, 0.3); }
+input[type="text"]:disabled { background-color: #f5f5f5; color: #95a5a6; cursor: not-allowed; }
 
 /* تصميم الأزرار */
 .primary-btn { width: calc(100% - 60px); padding: 15px; background-color: #3498db; color: white; border: none; border-radius: 8px; font-size: 1.2rem; cursor: pointer; transition: 0.3s; margin-bottom: 10px; }
 .primary-btn:hover { background-color: #2980b9; }
+.primary-btn:disabled { background-color: #bdc3c7; cursor: not-allowed; opacity: 0.6; }
+.primary-btn:disabled:hover { background-color: #bdc3c7; }
 .secondary-btn { width: 100%; padding: 15px; background-color: #e74c3c; color: white; border: none; border-radius: 8px; font-size: 1.2rem; cursor: pointer; transition: 0.3s; }
 .secondary-btn:hover { background-color: #c0392b; }
 .error-msg { color: #e74c3c; margin-top: 15px; font-weight: bold; }
+
+/* رسالة حجب البحث عند عدم الاتصال */
+.search-offline-block {
+    margin: -10px 30px 15px 30px;
+    padding: 12px 15px;
+    background: #fdecea;
+    color: #c0392b;
+    border: 2px solid #e74c3c;
+    border-radius: 8px;
+    text-align: center;
+    font-weight: bold;
+    font-size: 1rem;
+    animation: fadeIn 0.3s ease-out;
+}
 
 /* شاشة الترحيب المتحركة */
 .greeting-screen { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(44, 62, 80, 0.9); display: flex; justify-content: center; align-items: center; z-index: 1000; }
